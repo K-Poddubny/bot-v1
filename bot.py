@@ -12,7 +12,7 @@ async def send_text(update, text, reply_markup=None):
         except Exception:
             pass
         # reply в чат, откуда пришла кнопка
-        return await cq.messageawait send_text(update, 
+        return await cqawait send_text(update, 
             text,
             reply_markup=reply_markup,
             parse_mode=getattr(constants.ParseMode, "HTML", None)
