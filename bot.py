@@ -2,13 +2,19 @@ import os
 import re
 import csv
 import io
-import asyncio
 import logging
 import warnings
 from typing import Optional, List, Dict, Any
 
-from urllib3.exceptions import NotOpenSSLWarning
-warnings.filterwarnings('ignore', category=NotOpenSSLWarning)
+from dotenv import load_dotenv
+load_dotenv()  # если есть .env — подхватим TELEGRAM_BOT_TOKEN
+
+# приглушим ворнинги от urllib3 OpenSSL на маке
+try:
+    from urllib3.exceptions import NotOpenSSLWarning
+    warnings.filterwarnings("ignore", category=NotOpenSSLWarning)
+except Exception:
+    pass
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -19,48 +25,47 @@ from telegram.ext import (
 )
 import httpx
 
+# ===== Настройки =====
+# если переменной нет — используем твой токен как фолбэк
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or "8449257401:AAFLCuuyBi1Mmd63gkF6ujB1hGSdAFyn_9w"
 
-# Тихие логи
-logging.basicConfig(level=logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
-logging.getLogger("telegram.ext").setLevel(logging.WARNING)
-logger = logging.getLogger(__name__)
-
-# Константы
-CITIES = ["Москва"]
-ROLES = ["Водитель", "Курьер", "Разнорабочий", "Работник торгового зала"]
-
-# Google Sheet
 SHEET_ID = "1_KIjSrpBbc3xv-fuobapE2xj12kR6-tUmZEiLe41NKw"
-# Экспорт в CSV (gid=0 по умолчанию; если лист другой — подставим нужный gid)
 CSV_URLS = [
     f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv",
     f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv",
 ]
 
-COL_IDX = {
-    "desc": 3,        # D
-    "activity": 6,    # G
-    "salary_k": 10,   # K
-    "salary_l": 11,   # L
-    "title": 1,       # B (если нужно показывать)
-    "employer": 2,    # C
+CITIES = ["Москва"]
+ROLES = ["Водитель", "Курьер", "Разнорабочий", "Работник торгового зала"]
+
+# Индексы столбцов (0-based)
+COL = {
+    "TITLE": 1,      # B
+    "EMPLOYER": 2,   # C
+    "DESC": 3,       # D
+    "ACTIVITY": 6,   # G
+    "SAL_K": 10,     # K
+    "SAL_L": 11,     # L
 }
 
-# ---- Утилиты ----
+# Логи тише
+logging.basicConfig(level=logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+log = logging.getLogger("bot")
+
+# ===== Утилиты =====
 def parse_salary_value(text: str) -> Optional[int]:
     """
-    Поддерживает: 90000, 90 000, 90k/90к, 90 тыс, 1.2м, 120000-180000, 120 000 ₽
-    Возвращает максимум найденного.
+    Понимаем 90000, 90 000, 90k/90к, 90 тыс, 1.2м/1.2 млн, диапазоны (берём максимум).
     """
     if not text:
         return None
     t = str(text).lower().strip()
     nums: List[int] = []
 
-    # голые числа
+    # «голые» числа
     for m in re.findall(r"\d[\d\s.,]*", t):
         digits = re.sub(r"[^\d]", "", m)
         if digits:
@@ -69,16 +74,16 @@ def parse_salary_value(text: str) -> Optional[int]:
             except ValueError:
                 pass
 
-    # k / к / тыс
-    for val, _ in re.findall(r"(\d+(?:[\s.,]\d+)?)\s*(k|к|тыс)", t):
+    # k/к/тыс
+    for val, _unit in re.findall(r"(\d+(?:[\s.,]\d+)?)\s*(k|к|тыс)", t):
         try:
             v = int(float(val.replace(" ", "").replace(",", ".").replace("\u00a0", "")) * 1_000)
             nums.append(v)
         except ValueError:
             pass
 
-    # m / м / млн
-    for val, _ in re.findall(r"(\d+(?:[\s.,]\d+)?)\s*(m|м|млн)", t):
+    # m/м/млн
+    for val, _unit in re.findall(r"(\d+(?:[\s.,]\d+)?)\s*(m|м|млн)", t):
         try:
             v = int(float(val.replace(" ", "").replace(",", ".").replace("\u00a0", "")) * 1_000_000)
             nums.append(v)
@@ -96,11 +101,11 @@ async def http_get_bytes(url: str) -> Optional[bytes]:
             if r.status_code == 200 and r.content:
                 return r.content
     except Exception:
-        logger.exception("http get failed: %s", url)
+        log.exception("GET failed: %s", url)
     return None
 
 async def fetch_sheet_rows() -> List[List[str]]:
-    # Пробуем по очереди URL экспорта
+    """Тянем CSV из таблицы (перебором вариантов урла)."""
     for url in CSV_URLS:
         data = await http_get_bytes(url)
         if not data:
@@ -112,24 +117,24 @@ async def fetch_sheet_rows() -> List[List[str]]:
             if rows:
                 return rows
         except Exception:
-            logger.exception("csv parse failed")
+            log.exception("CSV parse failed")
     return []
 
 def salary_from_row(row: List[str]) -> Optional[int]:
     """Сначала L, если пусто — K."""
-    lval = row[COL_IDX["salary_l"]].strip() if len(row) > COL_IDX["salary_l"] else ""
-    kval = row[COL_IDX["salary_k"]].strip() if len(row) > COL_IDX["salary_k"] else ""
-    val = lval or kval
-    return parse_salary_value(val)
+    l = row[COL["SAL_L"]].strip() if len(row) > COL["SAL_L"] else ""
+    k = row[COL["SAL_K"]].strip() if len(row) > COL["SAL_K"] else ""
+    src = l or k
+    return parse_salary_value(src)
 
 def role_matches(row: List[str], role: str) -> bool:
-    act = row[COL_IDX["activity"]].lower() if len(row) > COL_IDX["activity"] else ""
+    act = row[COL["ACTIVITY"]].lower() if len(row) > COL["ACTIVITY"] else ""
     return role.lower() in act
 
 def pick_vacancies(rows: List[List[str]], role: str, want: int) -> Dict[str, Any]:
-    items = []
+    items: List[Dict[str, Any]] = []
     for i, row in enumerate(rows):
-        if i == 0:  # пропускаем заголовок
+        if i == 0:  # заголовок
             continue
         if not role_matches(row, role):
             continue
@@ -139,53 +144,53 @@ def pick_vacancies(rows: List[List[str]], role: str, want: int) -> Dict[str, Any
         items.append({
             "idx": i,
             "salary": smax,
-            "title": row[COL_IDX["title"]] if len(row) > COL_IDX["title"] else "Вакансия",
-            "employer": row[COL_IDX["employer"]] if len(row) > COL_IDX["employer"] else "",
-            "desc": row[COL_IDX["desc"]] if len(row) > COL_IDX["desc"] else "",
+            "title": row[COL["TITLE"]] if len(row) > COL["TITLE"] else "Вакансия",
+            "employer": row[COL["EMPLOYER"]] if len(row) > COL["EMPLOYER"] else "",
+            "desc": row[COL["DESC"]] if len(row) > COL["DESC"] else "",
         })
-
     items.sort(key=lambda x: x["salary"], reverse=True)
     top = items[:5]
-    found_higher = any(x["salary"] >= want for x in top)
-    return {"items": top, "found_higher": found_higher}
+    return {"items": top, "found_higher": any(x["salary"] >= want for x in top)}
+
+def pretty_rub(n: int) -> str:
+    return f"{n:,}".replace(",", " ") + " ₽"
 
 async def show_results_list(update: Update, context: ContextTypes.DEFAULT_TYPE,
                             results: Dict[str, Any], want: Optional[int] = None):
     items = results.get("items", [])
     found_higher = results.get("found_higher", False)
+
     if not items:
-        await (update.message or update.callback_query).reply_text("Пока нет подходящих вакансий. Попробуйте позже.")
+        await (update.message or update.callback_query).reply_text(
+            "Пока нет подходящих вакансий. Попробуйте позже.")
         return
 
     header = "Ура! Я нашёл зарплату выше твоего запроса 🎉" if (want and found_higher) \
              else "К сожалению, не нашёл именно такую зарплату, но есть варианты ниже:"
 
     lines = [header, ""]
-    kb_rows = []
+    kb = []
     for it in items:
-        pretty = f"{it['salary']:,}".replace(",", " ")
         title = it["title"] or "Вакансия"
-        lines.append(f"• {title} — {pretty} ₽")
-        kb_rows.append([InlineKeyboardButton(f"{title} — {pretty} ₽", callback_data=f"open:{it['idx']}")])
+        line = f"• {title} — {pretty_rub(it['salary'])}"
+        lines.append(line)
+        kb.append([InlineKeyboardButton(line[2:], callback_data=f"open:{it['idx']}")])
 
-    text = "\n".join(lines)
     await (update.message or update.callback_query).reply_text(
-        text, reply_markup=InlineKeyboardMarkup(kb_rows)
+        "\n".join(lines), reply_markup=InlineKeyboardMarkup(kb)
     )
 
-# ---- Хэндлеры ----
+# ===== Хэндлеры =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     kb = InlineKeyboardMarkup(
         [[InlineKeyboardButton("🔎 Найти вакансии", callback_data="find")]]
     )
     await (update.message or update.callback_query).reply_text(
-        "Привет! Я помогу тебе найти работу с самыми высокими зарплатами. Напиши, что тебя интересует — начнём!",
+        "Привет! Я помогу тебе найти работу с самыми высокими зарплатами. "
+        "Напиши, что тебя интересует — начнём!",
         reply_markup=kb
     )
-
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await (update.message or update.callback_query).reply_text("pong")
 
 async def btn_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -227,7 +232,7 @@ async def btn_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("Запись недоступна, попробуйте снова /start.")
             return
         row = rows[idx]
-        desc = row[COL_IDX["desc"]] if len(row) > COL_IDX["desc"] else "Описание недоступно."
+        desc = row[COL["DESC"]] if len(row) > COL["DESC"] else "Описание недоступно."
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("⬅️ Назад к вакансиям", callback_data="back_to_list"),
              InlineKeyboardButton("✅ Откликнуться", callback_data=f"apply:{idx}")]
@@ -249,14 +254,14 @@ async def ask_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     want = parse_salary_value(text_in)
     if not want:
         await update.message.reply_text(
-            "Я не понял сумму. Напиши *только цифрами* без слов, например: `90000`\n"
-            "Поддерживаются варианты: `90 000`, `90k/90к`, `90 тыс`.",
+            "Я не понял сумму. Напиши *только цифрами* без слов, например: `90000`.\n"
+            "Поддерживаются: `90 000`, `90k/90к`, `90 тыс`, `1.2м`.",
             parse_mode="Markdown"
         )
         return
 
     context.user_data["salary"] = want
-    await update.message.reply_text(f"Принял сумму: {want:,} ₽. Ищу подходящие вакансии…".replace(",", " "))
+    await update.message.reply_text(f"Принял сумму: {pretty_rub(want)}. Ищу подходящие вакансии…")
 
     rows = await fetch_sheet_rows()
     if not rows:
@@ -273,20 +278,33 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("state") == "AWAIT_SALARY":
         await ask_salary(update, context)
         return
-    # игнорируем прочее текстовое
+    # игнорируем свободный ввод
     return
+
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await (update.message or update.callback_query).reply_text("pong")
 
 def main():
     app = Application.builder().token(TOKEN).build()
 
+    # команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
+    # кнопки и текст
     app.add_handler(CallbackQueryHandler(btn_router))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
-    async def _on_start(_: Application):
+    async def _post_init(_: Application):
+        # снимаем вебхук на всякий случай (чтобы polling не конфликтовал)
+        try:
+            await app.bot.delete_webhook(drop_pending_updates=False)
+        except Exception:
+            pass
         me = await app.bot.get_me()
-        print(f"[bot] online: @{me.username}", flush=True)
+        print(f"[✓] Bot online: @{me.username}", flush=True)
 
-    app.post_init = _on_start
+    app.post_init = _post_init
     app.run_polling()
+
+if __name__ == "__main__":
+    main()
