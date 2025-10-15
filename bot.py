@@ -233,6 +233,7 @@ async def btn_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         row = rows[idx]
         desc = row[COL["DESC"]] if len(row) > COL["DESC"] else "Описание недоступно."
+        desc = format_vacancy_desc(desc)
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("⬅️ Назад к вакансиям", callback_data="back_to_list"),
              InlineKeyboardButton("✅ Откликнуться", callback_data=f"apply:{idx}")]
@@ -283,6 +284,106 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await (update.message or update.callback_query).reply_text("pong")
+
+
+def format_vacancy_desc(raw: str) -> str:
+    """
+    Очищает описание вакансии от мусора (***, --- и т.п.), выравнивает списки,
+    добавляет эмодзи к распознанным заголовкам и делает читаемые блоки.
+    """
+    if not raw:
+        return "Описание недоступно."
+
+    text = raw.replace("\r\n", "\n").replace("\r", "\n")
+
+    # убираем жирность/курсив Markdown и визуальный мусор
+    text = re.sub(r"\*{1,3}", "", text)           # *** -> ''
+    text = re.sub(r"`{1,3}", "", text)            # ``` -> ''
+    text = re.sub(r"[_]{2,}", "_", text)          # ____ -> _
+    # убираем линейки/разделители
+    text = re.sub(r"^\s*[-–—]{3,}\s*$", "", text, flags=re.MULTILINE)
+
+    # разрезаем на строки и чистим лидирующие маркеры (- — • * ·)
+    lines = []
+    for ln in text.split("\n"):
+        ln = ln.strip()
+        if not ln:
+            lines.append("")
+            continue
+        ln = re.sub(r"^[\-\–\—\•\*·\u2022]+[)\.]?\s*", "", ln)  # убираем пули
+        ln = re.sub(r"^\d+\)\s*", "", ln)                       # 1) пункт
+        ln = re.sub(r"^\(\d+\)\s*", "", ln)                     # (1) пункт
+        ln = re.sub(r"\s{2,}", " ", ln)
+        lines.append(ln)
+
+    # склеим последовательные пустые
+    compact = []
+    for ln in lines:
+        if ln == "" and (not compact or compact[-1] == ""):
+            continue
+        compact.append(ln)
+    lines = compact
+
+    # Распознаём заголовки и добавляем эмодзи
+    headers = [
+        (r"^(мы\s+предлагаем|условия|что\s+предлагаем|что\s+получишь)\b", "💼", "Мы предлагаем"),
+        (r"^(обязанности|что\s+нужно\s+делать|что\s+делать|чем\s+заниматься)\b", "🧰", "Обязанности"),
+        (r"^(требования|мы\s+ожидаем|кандидат|что\s+нужно)\b", "✅", "Требования"),
+        (r"^(оплата|зарплата|доход|компенсации|бонусы|условия\s+оплаты)\b", "💰", "Оплата и бонусы"),
+        (r"^(как\s+откликнуться|что\s+делать\s+дальше|как\s+начать|оформление)\b", "📩", "Как откликнуться"),
+    ]
+
+    def to_header(line: str) -> str:
+        low = line.lower()
+        for pat, emoji, title in headers:
+            if re.search(pat, low):
+                return f"{emoji} {title}"
+        # если строка очень короткая и без точки — вероятно заголовок
+        if len(line) <= 40 and not re.search(r"[.!?]$", line):
+            return f"📌 {line}"
+        return line
+
+    blocks = []
+    buf = []
+    def flush_buf():
+        if not buf:
+            return
+        # формат списка: добавим маркеры "•"
+        formatted = []
+        for b in buf:
+            if not b:
+                continue
+            formatted.append(("• " + b) if not re.search(r"^[\w\(\[]", b) else ("• " + b))
+        blocks.append("\n".join(formatted))
+        buf.clear()
+
+    for ln in lines:
+        if not ln:
+            flush_buf()
+            continue
+        # распознаём явный заголовок
+        if re.match(r"^[A-Za-zА-Яа-яЁё].{0,60}$", ln) and not re.search(r"[.!?]$", ln):
+            # если похоже на заголовок — начинаем новый блок
+            flush_buf()
+            blocks.append(to_header(ln))
+            continue
+        # обычная строка — в текущий буфер
+        buf.append(ln)
+    flush_buf()
+
+    # склеиваем блоки с пустой строкой между ними
+    out_lines = []
+    for i, b in enumerate(blocks):
+        if i > 0:
+            out_lines.append("")
+        out_lines.append(b)
+
+    out = "\n".join(out_lines).strip()
+
+    # финальные подчистки
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out or "Описание недоступно."
+
 
 def main():
     app = Application.builder().token(TOKEN).build()
