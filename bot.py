@@ -40,20 +40,39 @@ COL_DESC     = 3   # D — описание/детали
 COL_SALARY_K = 10  # K
 COL_SALARY_L = 11  # L (приоритет)
 
-def parse_salary_value(text: str) -> Optional[int]:
+def parse_salary_value(text: str) -> int | None:
     """
-    Возвращаем одно число — максимум из найденных чисел.
-    Поддерживает '90 000', '90k', '50-120 тыс', 'от 100000', '120000 ₽', '120 000-180 000'.
+    Парсим сумму: 90000, 90 000, 90k/90к, 90 тыс, 1.2м/1.2 млн, диапазоны.
+    Возвращаем максимум из найденных значений.
     """
+    import re
     if not text:
         return None
-    # заменим запятые и нецифровые разделители
-    nums = [int("".join(re.findall(r"\d", n))) for n in re.findall(r"\d[\d\s]*", text)]
-    if not nums:
-        # иногда пишут '90k' или '90 тыс'
-        k_match = re.findall(r"(\d+)\s*(k|тыс)", text.lower())
-        if k_match:
-            nums = [int(n) * 1000 for n, _ in k_match]
+    t = str(text).lower().strip()
+    nums: list[int] = []
+
+    # 1) «голые» числа с пробелами/точками/знаком валюты
+    for m in re.findall(r"\d[\d\s.,]*", t):
+        digits = re.sub(r"[^\d]", "", m)
+        if digits:
+            nums.append(int(digits))
+
+    # 2) 90k / 90к / 90 тыс
+    for val, _ in re.findall(r"(\d+(?:[\s.,]\d+)?)\s*(k|к|тыс)", t):
+        try:
+            v = int(float(val.replace(" ", "").replace(",", ".").replace("\u00a0",""))*1_000)
+            nums.append(v)
+        except ValueError:
+            pass
+
+    # 3) 1.2m / 1.2м / 1.2 млн
+    for val, _ in re.findall(r"(\d+(?:[\s.,]\d+)?)\s*(m|м|млн)", t):
+        try:
+            v = int(float(val.replace(" ", "").replace(",", ".").replace("\u00a0",""))*1_000_000)
+            nums.append(v)
+        except ValueError:
+            pass
+
     if not nums:
         return None
     return max(nums)
@@ -200,19 +219,19 @@ async def btn_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def ask_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    want = parse_salary_value(text)
+    text_in = (update.message.text or "").strip()
+    want = parse_salary_value(text_in)
     if not want:
-        msg = (
-            "Я не понял сумму. Напиши только цифрами, без слов, например: 90000\n"
-            "Поддерживаются варианты: 90 000, 90k/90к, 90 тыс."
-        )
-        await update.message.reply_text(msg)
+        msg = ("Я не понял сумму. Напиши *только цифрами* без слов, например: `90000`\n"
+               "Поддерживаются варианты: `90 000`, `90k/90к`, `90 тыс`.")
+        await update.message.reply_text(msg, parse_mode="Markdown")
         return SALARY_ASK
 
     context.user_data["salary"] = want
+    # Немедленный отклик
+    pretty = f"{want:,}".replace(",", " ")
+    await update.message.reply_text(f"Принял сумму: {pretty} ₽. Ищу подходящие вакансии…")
 
-    # тянем таблицу и фильтруем
     try:
         rows = fetch_sheet_rows()
     except Exception:
@@ -221,11 +240,17 @@ async def ask_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     context.user_data["rows_cache"] = rows
-    results = pick_vacancies(rows, context.user_data["role"], want)
+    results = pick_vacancies(rows, context.user_data.get("role",""), want)
     context.user_data["last_results"] = results
+
+    items = results.get("items") or []
+    if not items:
+        await update.message.reply_text("Пока нет подходящих вакансий. Попробуйте позже.")
+        return ConversationHandler.END
 
     await show_results_list(update, context, results, want)
     return SHOW_RESULTS
+
 async def show_results_list(update: Update, context: ContextTypes.DEFAULT_TYPE, results: Dict[str, Any], want: Optional[int]=None):
     items = results["items"]
     above = results["above"] if want is None else any(i["salary"] >= want for i in items)
