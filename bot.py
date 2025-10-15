@@ -274,9 +274,18 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = Application.builder().token(TOKEN).build()
+    # команды
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("ping", ping))
+    # кнопки и текст
     app.add_handler(CallbackQueryHandler(btn_router))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+
+    async def _on_start(_: Application):
+        me = await app.bot.get_me()
+        print(f"[bot] online: @{me.username}", flush=True)
+
+    app.post_init = _on_start
     app.run_polling()
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -285,3 +294,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await ask_salary(update, context)
     # можно добавить другие состояния позже
     return None
+
+
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await (update.message or update.callback_query).reply_text("pong")
