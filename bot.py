@@ -1,5 +1,5 @@
 import os, re, csv, io, asyncio, logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Optional
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -40,7 +40,7 @@ COL_DESC     = 3   # D — описание/детали
 COL_SALARY_K = 10  # K
 COL_SALARY_L = 11  # L (приоритет)
 
-def parse_salary_value(text: str) -> int | None:
+def parse_salary_value(text: str) -> Optional[int]:
     """
     Парсим сумму: 90000, 90 000, 90k/90к, 90 тыс, 1.2м/1.2 млн, диапазоны.
     Возвращаем максимум из найденных значений.
