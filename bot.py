@@ -145,6 +145,7 @@ def fmt_salary_for_user(item: Dict[str, Any]) -> str:
 
 # ---- Хендлеры
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔎 Найти вакансии", callback_data="find")],
     ])
@@ -164,59 +165,55 @@ async def btn_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     await query.answer()
 
-    # Шаг 1: клик "Найти вакансии" -> выбор города
     if data == "find":
         kb = InlineKeyboardMarkup([[InlineKeyboardButton(c, callback_data=f"city:{c}") for c in CITIES]])
         await query.edit_message_text("Выберите город:", reply_markup=kb)
-        return CITY_CHOOSER
+        context.user_data["state"] = "CHOOSE_CITY"
+        return
 
-    # Шаг 2: выбран город -> выбор роли
     if data.startswith("city:"):
         city = data.split(":", 1)[1]
         context.user_data["city"] = city
         kb_rows = [[InlineKeyboardButton(role, callback_data=f"role:{role}")] for role in ROLES]
-        await query.edit_message_text(f"Город: {city}\nКем хотите работать?", reply_markup=InlineKeyboardMarkup(kb_rows))
-        return ROLE_CHOOSER
+        await query.edit_message_text(f"Город: {city}\nКем хотите работать?",
+                                      reply_markup=InlineKeyboardMarkup(kb_rows))
+        context.user_data["state"] = "CHOOSE_ROLE"
+        return
 
-    # Шаг 3: выбрана роль -> просим зарплату
     if data.startswith("role:"):
         role = data.split(":", 1)[1]
         context.user_data["role"] = role
+        context.user_data["state"] = "AWAIT_SALARY"
         await query.edit_message_text(
             f"Город: {context.user_data.get('city')}\n"
             f"Роль: {role}\n\n"
             "Введите желаемую зарплату в месяц (например: 90 000):"
         )
-        return SALARY_ASK
+        return
 
-    # Шаг 5: выбор вакансии из списка -> подробности
     if data.startswith("open:"):
         idx = int(data.split(":", 1)[1])
         rows = context.user_data.get("rows_cache", [])
         if not rows or idx <= 0 or idx >= len(rows):
             await query.edit_message_text("Запись недоступна, попробуйте снова /start.")
-            return ConversationHandler.END
+            return
         row = rows[idx]
-        # row — это CSV-список; покажем описание из D
-        desc = row[COL_DESC] if len(row) > COL_DESC else "Описание недоступно."
+        desc = row[3] if len(row) > 3 else "Описание недоступно."
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("⬅️ Назад к вакансиям", callback_data="back_to_list"),
              InlineKeyboardButton("✅ Откликнуться", callback_data=f"apply:{idx}")]
         ])
         await query.edit_message_text(desc, reply_markup=kb)
-        return SHOW_RESULTS
+        return
 
     if data == "back_to_list":
-        # перерисуем список
         results = context.user_data.get("last_results", {})
         await show_results_list(update, context, results)
-        return SHOW_RESULTS
+        return
 
     if data.startswith("apply:"):
         await query.edit_message_text("Отлично! Я передам ваше желание откликнуться. (демо-режим)")
-        return SHOW_RESULTS
-
-    return ConversationHandler.END
+        return
 
 async def ask_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text_in = (update.message.text or "").strip()
@@ -277,23 +274,14 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = Application.builder().token(TOKEN).build()
-
-    conv = ConversationHandler(entry_points=[CommandHandler("start", start)],
-        states={
-            CITY_CHOOSER: [CallbackQueryHandler(btn_router)],
-            ROLE_CHOOSER: [CallbackQueryHandler(btn_router)],
-            SALARY_ASK:   [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_salary)],
-            SHOW_RESULTS: [CallbackQueryHandler(btn_router)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-    )
-
-    # Доп. кнопка "Найти вакансии" в стартовом сообщении — тоже вход в диалог
-    app.add_handler(CallbackQueryHandler(btn_router, pattern="^(find|city:|role:|open:|back_to_list|apply:)"))
-    app.add_handler(conv)
-
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(btn_router))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.run_polling()
 
-if __name__ == "__main__":
-    main()
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = context.user_data.get("state")
+    if state == "AWAIT_SALARY":
+        return await ask_salary(update, context)
+    # можно добавить другие состояния позже
+    return None
