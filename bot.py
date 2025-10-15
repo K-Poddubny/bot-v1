@@ -19,9 +19,7 @@ from telegram.ext import (
 )
 import httpx
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not TOKEN:
-    raise SystemExit("TELEGRAM_BOT_TOKEN env is required")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or "8449257401:AAFLCuuyBi1Mmd63gkF6ujB1hGSdAFyn_9w"
 
 # Тихие логи
 logging.basicConfig(level=logging.WARNING)
