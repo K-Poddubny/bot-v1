@@ -16,7 +16,13 @@ from telegram.ext import (
     CallbackQueryHandler, MessageHandler, filters
 )
 
-logging.basicConfig(level=logging.INFO)
+import warnings
+from urllib3.exceptions import NotOpenSSLWarning
+warnings.filterwarnings('ignore', category=NotOpenSSLWarning)
+logging.basicConfig(level=logging.WARNING)
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('telegram').setLevel(logging.WARNING)
+logging.getLogger('telegram.ext').setLevel(logging.WARNING)
 logger = logging.getLogger("jobbot")
 
 # ---- Константы сценария
@@ -246,6 +252,8 @@ def main():
     app = Application.builder().token(TOKEN).build()
 
     conv = ConversationHandler(
+        per_message=True,
+
         entry_points=[CommandHandler("start", start)],
         states={
             CITY_CHOOSER: [CallbackQueryHandler(btn_router)],
