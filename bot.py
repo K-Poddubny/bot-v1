@@ -251,10 +251,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TOKEN).build()
 
-    conv = ConversationHandler(
-        per_message=True,
-
-        entry_points=[CommandHandler("start", start)],
+    conv = ConversationHandler(entry_points=[CommandHandler("start", start)],
         states={
             CITY_CHOOSER: [CallbackQueryHandler(btn_router)],
             ROLE_CHOOSER: [CallbackQueryHandler(btn_router)],
