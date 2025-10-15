@@ -1,3 +1,10 @@
+##EARLY_WARN_MUTE##
+import warnings
+try:
+    from urllib3.exceptions import NotOpenSSLWarning
+    warnings.filterwarnings('ignore', category=NotOpenSSLWarning)
+except Exception:
+    pass
 import os, re, csv, io, asyncio, logging
 from typing import List, Dict, Any, Optional, Optional
 
@@ -277,7 +284,7 @@ def main():
     # команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
-    # кнопки и текст
+    # кнопки/текст
     app.add_handler(CallbackQueryHandler(btn_router))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
@@ -286,8 +293,16 @@ def main():
         print(f"[bot] online: @{me.username}", flush=True)
 
     app.post_init = _on_start
-    app.run_polling()
 
+    try:
+        app.run_polling(allowed_updates=None, stop_signals=None)
+    except Exception as e:
+        import traceback, sys
+        print("
+[bot] crashed with exception:
+", flush=True)
+        traceback.print_exc()
+        sys.exit(1)
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get("state")
     if state == "AWAIT_SALARY":
