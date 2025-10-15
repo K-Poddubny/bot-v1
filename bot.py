@@ -1,7 +1,6 @@
 import os
 import sys
 from dotenv import load_dotenv
-
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
