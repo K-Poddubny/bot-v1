@@ -200,11 +200,14 @@ async def btn_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def ask_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # пользователь прислал сообщение с зарплатой
-    text = update.message.text
+    text = (update.message.text or "").strip()
     want = parse_salary_value(text)
     if not want:
-        await update.message.reply_text("Не понял сумму. Введите число, например: 90 000")
+        msg = (
+            "Я не понял сумму. Напиши только цифрами, без слов, например: 90000\n"
+            "Поддерживаются варианты: 90 000, 90k/90к, 90 тыс."
+        )
+        await update.message.reply_text(msg)
         return SALARY_ASK
 
     context.user_data["salary"] = want
@@ -212,7 +215,7 @@ async def ask_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # тянем таблицу и фильтруем
     try:
         rows = fetch_sheet_rows()
-    except Exception as e:
+    except Exception:
         logger.exception("fetch error")
         await update.message.reply_text("Не удалось получить вакансии. Попробуйте позже.")
         return ConversationHandler.END
@@ -223,7 +226,6 @@ async def ask_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await show_results_list(update, context, results, want)
     return SHOW_RESULTS
-
 async def show_results_list(update: Update, context: ContextTypes.DEFAULT_TYPE, results: Dict[str, Any], want: Optional[int]=None):
     items = results["items"]
     above = results["above"] if want is None else any(i["salary"] >= want for i in items)
