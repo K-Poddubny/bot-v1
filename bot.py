@@ -1,3 +1,42 @@
+
+from telegram import constants
+
+async def send_text(update, text, reply_markup=None):
+    """
+    Унифицированная отправка сообщений и из message, и из callback_query.
+    """
+    cq = getattr(update, "callback_query", None)
+    if cq:
+        try:
+            await cq.answer()
+        except Exception:
+            pass
+        # reply в чат, откуда пришла кнопка
+        return await cq.message.reply_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=getattr(constants.ParseMode, "HTML", None)
+        )
+    msg = getattr(update, "message", None)
+    if msg:
+        return await msg.reply_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=getattr(constants.ParseMode, "HTML", None)
+        )
+    # Фолбек на бот, если что-то экзотическое
+    chat_id = None
+    try:
+        chat_id = update.effective_chat.id
+    except Exception:
+        pass
+    if chat_id and "context" in update.to_dict():
+        return await update.to_dict()["context"].bot.send_message(
+            chat_id=chat_id, text=text, reply_markup=reply_markup,
+            parse_mode=getattr(constants.ParseMode, "HTML", None)
+        )
+    return None
+
 import os
 import re
 import csv
@@ -161,7 +200,7 @@ async def show_results_list(update: Update, context: ContextTypes.DEFAULT_TYPE,
     found_higher = results.get("found_higher", False)
 
     if not items:
-        await (update.message or update.callback_query).reply_text(
+        await await send_text(update, 
             "Пока нет подходящих вакансий. Попробуйте позже.")
         return
 
@@ -176,7 +215,7 @@ async def show_results_list(update: Update, context: ContextTypes.DEFAULT_TYPE,
         lines.append(line)
         kb.append([InlineKeyboardButton(line[2:], callback_data=f"open:{it['idx']}")])
 
-    await (update.message or update.callback_query).reply_text(
+    await await send_text(update, 
         "\n".join(lines), reply_markup=InlineKeyboardMarkup(kb)
     )
 
@@ -186,7 +225,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup(
         [[InlineKeyboardButton("🔎 Найти вакансии", callback_data="find")]]
     )
-    await (update.message or update.callback_query).reply_text(
+    await await send_text(update, 
         "Привет! Я помогу тебе найти работу с самыми высокими зарплатами. "
         "Напиши, что тебя интересует — начнём!",
         reply_markup=kb
@@ -254,7 +293,7 @@ async def ask_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text_in = (update.message.text or "").strip()
     want = parse_salary_value(text_in)
     if not want:
-        await update.message.reply_text(
+        await await send_text(update, 
             "Я не понял сумму. Напиши *только цифрами* без слов, например: `90000`.\n"
             "Поддерживаются: `90 000`, `90k/90к`, `90 тыс`, `1.2м`.",
             parse_mode="Markdown"
@@ -262,11 +301,11 @@ async def ask_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data["salary"] = want
-    await update.message.reply_text(f"Принял сумму: {pretty_rub(want)}. Ищу подходящие вакансии…")
+    await await send_text(update, f"Принял сумму: {pretty_rub(want)}. Ищу подходящие вакансии…")
 
     rows = await fetch_sheet_rows()
     if not rows:
-        await update.message.reply_text("Не удалось получить вакансии. Попробуйте позже.")
+        await await send_text(update, "Не удалось получить вакансии. Попробуйте позже.")
         return
     context.user_data["rows_cache"] = rows
 
@@ -283,7 +322,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await (update.message or update.callback_query).reply_text("pong")
+    await await send_text(update, "pong")
 
 
 
