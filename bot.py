@@ -293,12 +293,8 @@ def main():
         print(f"[bot] online: @{me.username}", flush=True)
 
     app.post_init = _on_start
-
-    try:
-        app.run_polling(allowed_updates=None, stop_signals=None)
-    except Exception as e:
-        import traceback, sys
-        print("
+    app.run_polling()
+print("[bot] online")
 [bot] crashed with exception:
 ", flush=True)
         traceback.print_exc()
