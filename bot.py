@@ -1,473 +1,331 @@
+# -*- coding: utf-8 -*-
+# Telegram Job Bot (PTB 22.x)
+# Старт/стоп: ./run.sh  (остановка — Ctrl+C)
 
-from telegram import constants
-
-async def send_text(update, text, reply_markup=None):
-    """
-    Унифицированная отправка сообщений и из message, и из callback_query.
-    """
-    cq = getattr(update, "callback_query", None)
-    if cq:
-        try:
-            await cq.answer()
-        except Exception:
-            pass
-        # reply в чат, откуда пришла кнопка
-        return await send_text(update, 
-            text,
-            reply_markup=reply_markup,
-            parse_mode=getattr(constants.ParseMode, "HTML", None)
-        )
-    msg = getattr(update, "message", None)
-    if msg:
-        return await send_text(update, 
-            text,
-            reply_markup=reply_markup,
-            parse_mode=getattr(constants.ParseMode, "HTML", None)
-        )
-    # Фолбек на бот, если что-то экзотическое
-    chat_id = None
-    try:
-        chat_id = update.effective_chat.id
-    except Exception:
-        pass
-    if chat_id and "context" in update.to_dict():
-        return await update.to_dict()["context"].bot.send_message(
-            chat_id=chat_id, text=text, reply_markup=reply_markup,
-            parse_mode=getattr(constants.ParseMode, "HTML", None)
-        )
-    return None
+from __future__ import annotations
 
 import os
 import re
 import csv
 import io
 import logging
-import warnings
-from typing import Optional, List, Dict, Any
+import asyncio
+from typing import Any, List, Dict, Optional, Tuple
 
-from dotenv import load_dotenv
-load_dotenv()  # если есть .env — подхватим TELEGRAM_BOT_TOKEN
-
-# приглушим ворнинги от urllib3 OpenSSL на маке
-try:
-    from urllib3.exceptions import NotOpenSSLWarning
-    warnings.filterwarnings("ignore", category=NotOpenSSLWarning)
-except Exception:
-    pass
-
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-)
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ContextTypes, filters,
-)
 import httpx
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler, MessageHandler,
+    ContextTypes, filters
+)
 
-# ===== Настройки =====
-# если переменной нет — используем твой токен как фолбэк
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or "8449257401:AAFLCuuyBi1Mmd63gkF6ujB1hGSdAFyn_9w"
+# ================== НАСТРОЙКИ ==================
+TOKEN = "8449257401:AAFLCuuyBi1Mmd63gkF6ujB1hGSdAFyn_9w"
 
-SHEET_ID = "1_KIjSrpBbc3xv-fuobapE2xj12kR6-tUmZEiLe41NKw"
-CSV_URLS = [
-    f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv",
-    f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv",
-]
-
-CITIES = ["Москва"]
-ROLES = ["Водитель", "Курьер", "Разнорабочий", "Работник торгового зала"]
+# Источник данных: экспорт листа Google Sheets в CSV
+SHEET_CSV_URL = (
+    "https://docs.google.com/spreadsheets/d/"
+    "1_KIjSrpBbc3xv-fuobapE2xj12kR6-tUmZEiLe41NKw/export?format=csv"
+)
 
 # Индексы столбцов (0-based)
-COL = {
-    "TITLE": 1,      # B
-    "EMPLOYER": 2,   # C
-    "DESC": 3,       # D
-    "ACTIVITY": 6,   # G
-    "SAL_K": 10,     # K
-    "SAL_L": 11,     # L
-}
+COL_ROLE = 6           # G — Вид деятельности
+COL_CITY = 7           # H — Город
+COL_TITLE = 2          # C — Название/Компания
+COL_DESC = 3           # D — Описание
+COL_SAL_PRIOR = 11     # L — Зарплата (приоритет)
+COL_SAL_FALLBACK = 10  # K — Зарплата (если L пустой)
+
+# Выбор ролей
+ROLES = ["Водитель", "Курьер", "Разнорабочий", "Работник торгового зала"]
+
+# Сообщения
+MSG_GREETING = "Привет! Я помогу найти вакансии с самыми высокими зарплатами."
+MSG_CHOOSE_CITY = "Выберите город:"
+MSG_CHOOSE_ROLE = "Кем хотите работать?"
+MSG_ASK_SALARY = "Укажите желаемую зарплату в месяц (например: 90 000):"
+MSG_SALARY_BAD = "Не понял. Напишите только цифрами (можно с пробелами), например: 90000"
+MSG_FOUND_ABOVE = "🎉 Ура, я нашёл вакансии с зарплатой выше или равной желаемой!"
+MSG_FOUND_BELOW = "🙇 К сожалению, вакансий с такой зарплатой нет, но вот лучшие близкие варианты:"
+MSG_EMPTY = "По выбранным параметрам ничего не нашли. Попробуйте изменить город или сумму."
 
 # Логи тише
-logging.basicConfig(level=logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
-logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+for noisy in ("httpx", "httpcore", "telegram", "telegram.ext", "urllib3"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
-# ===== Утилиты =====
+
+# ================== УТИЛИТЫ ==================
+def chunked(items: List[Any], n: int) -> List[List[Any]]:
+    return [items[i:i+n] for i in range(0, len(items), n)]
+
+def kb(rows: List[List[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(rows or [])
+
+def norm(s: Optional[str]) -> str:
+    return (s or "").strip()
+
+def norm_lc(s: Optional[str]) -> str:
+    return norm(s).lower()
+
 def parse_salary_value(text: str) -> Optional[int]:
-    """
-    Понимаем 90000, 90 000, 90k/90к, 90 тыс, 1.2м/1.2 млн, диапазоны (берём максимум).
-    """
+    """Извлекает число (руб/мес) из произвольной строки: '90 000', '90к/90k', '100 тыс', '100-120'."""
     if not text:
         return None
-    t = str(text).lower().strip()
-    nums: List[int] = []
-
-    # «голые» числа
-    for m in re.findall(r"\d[\d\s.,]*", t):
-        digits = re.sub(r"[^\d]", "", m)
-        if digits:
-            try:
-                nums.append(int(digits))
-            except ValueError:
-                pass
-
-    # k/к/тыс
-    for val, _unit in re.findall(r"(\d+(?:[\s.,]\d+)?)\s*(k|к|тыс)", t):
-        try:
-            v = int(float(val.replace(" ", "").replace(",", ".").replace("\u00a0", "")) * 1_000)
-            nums.append(v)
-        except ValueError:
-            pass
-
-    # m/м/млн
-    for val, _unit in re.findall(r"(\d+(?:[\s.,]\d+)?)\s*(m|м|млн)", t):
-        try:
-            v = int(float(val.replace(" ", "").replace(",", ".").replace("\u00a0", "")) * 1_000_000)
-            nums.append(v)
-        except ValueError:
-            pass
-
-    if not nums:
-        return None
-    return max(nums)
-
-async def http_get_bytes(url: str) -> Optional[bytes]:
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.get(url)
-            if r.status_code == 200 and r.content:
-                return r.content
-    except Exception:
-        log.exception("GET failed: %s", url)
+    t = str(text).lower()
+    t = (t.replace("рублей", "руб").replace("руб.", "руб").replace("₽", "руб")
+           .replace("тыс.", "тыс").replace("тысяч", "тыс").replace("тысячи", "тыс")
+           .replace("k", "к"))
+    # диапазон
+    m = re.search(r'(\d[\d\s.,]*)\s*(?:-|–|—)\s*(\d[\d\s.,]*)\s*(к|тыс)?', t)
+    if m:
+        a, b, suf = m.group(1), m.group(2), m.group(3)
+        return max(_to_int(a, suf), _to_int(b, suf)) or None
+    # обычное число + возможный суффикс
+    m = re.search(r'(\d[\d\s.,]*)\s*(к|тыс)?', t)
+    if m:
+        return _to_int(m.group(1), m.group(2)) or None
     return None
 
-async def fetch_sheet_rows() -> List[List[str]]:
-    """Тянем CSV из таблицы (перебором вариантов урла)."""
-    for url in CSV_URLS:
-        data = await http_get_bytes(url)
-        if not data:
+def _to_int(raw: str, suf: Optional[str]) -> int:
+    digits = re.sub(r'\D', '', raw or "")
+    if not digits:
+        return 0
+    n = int(digits)
+    if suf in ("к", "тыс"):
+        n *= 1000
+    return n
+
+def clean_description(raw: str) -> str:
+    """Чистим HTML, лишние символы, маркеры и добавляем эмодзи к ключевым блокам."""
+    if not raw:
+        return "Описание отсутствует."
+    t = raw
+    t = re.sub(r'<br\s*/?>', '\n', t, flags=re.I)
+    t = re.sub(r'<[^>]+>', '', t)
+    t = t.replace("&nbsp;", " ")
+    # убрать рекламные/служебные строки типа «Ищем Водителей...»
+    t = re.sub(r'(?im)^\s*ищем\s+[^.\n]+\s*$', '', t)
+    # маркеры → точки
+    t = t.replace("—", "-").replace("–", "-")
+    t = re.sub(r'[\u2022•▪︎▫︎●◦◆►✔✅➤➔➤]', '•', t)
+    t = re.sub(r'-{2,}', '-', t)
+    # заголовки
+    repl = [
+        (r'(?im)^\s*мы предлагаем\s*:?$', "✨ Мы предлагаем:"),
+        (r'(?im)^\s*мы ожидаем[^:]*\s*:?$', "🧩 Мы ожидаем:"),
+        (r'(?im)^\s*требования\s*:?$', "📌 Требования:"),
+        (r'(?im)^\s*обязанности\s*:?$', "🛠 Обязанности:"),
+        (r'(?im)^\s*условия\s*:?$', "📄 Условия:")
+    ]
+    for pat, rep in repl:
+        t = re.sub(pat, rep, t)
+    t = re.sub(r'\n{3,}', '\n\n', t).strip()
+    return t or "Описание отсутствует."
+
+def salary_from_row(row: List[str]) -> int:
+    val = ""
+    if len(row) > COL_SAL_PRIOR and norm(row[COL_SAL_PRIOR]):
+        val = row[COL_SAL_PRIOR]
+    elif len(row) > COL_SAL_FALLBACK and norm(row[COL_SAL_FALLBACK]):
+        val = row[COL_SAL_FALLBACK]
+    s = parse_salary_value(val)
+    return s or 0
+
+def title_from_row(row: List[str]) -> str:
+    parts = []
+    if len(row) > COL_TITLE and norm(row[COL_TITLE]):
+        parts.append(norm(row[COL_TITLE]))
+    if len(row) > COL_ROLE and norm(row[COL_ROLE]):
+        parts.append(norm(row[COL_ROLE]))
+    return " — ".join(parts) if parts else "Вакансия"
+
+def city_from_row(row: List[str]) -> str:
+    return norm(row[COL_CITY]) if len(row) > COL_CITY else ""
+
+def role_match(row: List[str], role: str) -> bool:
+    return role.lower() in norm_lc(row[COL_ROLE] if len(row) > COL_ROLE else "")
+
+
+# ================== ДАННЫЕ ==================
+def fetch_sheet_rows_sync() -> List[List[str]]:
+    with httpx.Client(timeout=20) as client:
+        r = client.get(SHEET_CSV_URL, follow_redirects=True)
+        r.raise_for_status()
+        text = r.content.decode("utf-8-sig", errors="replace")
+    reader = csv.reader(io.StringIO(text))
+    rows = [list(row) for row in reader]
+    # срежем хедер, если там "вид деятельности"
+    if rows and len(rows[0]) > COL_ROLE and "вид" in norm_lc(rows[0][COL_ROLE]):
+        rows = rows[1:]
+    return rows
+
+async def get_rows(context: ContextTypes.DEFAULT_TYPE) -> List[List[str]]:
+    cache = context.bot_data.get("rows_cache")
+    if isinstance(cache, list) and cache:
+        return cache
+    rows = await asyncio.to_thread(fetch_sheet_rows_sync)
+    context.bot_data["rows_cache"] = rows
+    return rows
+
+def unique_cities(rows: List[List[str]]) -> List[str]:
+    seen, out = set(), []
+    for r in rows:
+        c = city_from_row(r)
+        if not c:
             continue
-        try:
-            text = data.decode("utf-8", errors="ignore")
-            reader = csv.reader(io.StringIO(text))
-            rows = [row for row in reader]
-            if rows:
-                return rows
-        except Exception:
-            log.exception("CSV parse failed")
-    return []
+        key = c.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(c)
+    if "Москва" in out:
+        out = ["Москва"] + [x for x in out if x != "Москва"]
+    return out or ["Москва"]
 
-def salary_from_row(row: List[str]) -> Optional[int]:
-    """Сначала L, если пусто — K."""
-    l = row[COL["SAL_L"]].strip() if len(row) > COL["SAL_L"] else ""
-    k = row[COL["SAL_K"]].strip() if len(row) > COL["SAL_K"] else ""
-    src = l or k
-    return parse_salary_value(src)
 
-def role_matches(row: List[str], role: str) -> bool:
-    act = row[COL["ACTIVITY"]].lower() if len(row) > COL["ACTIVITY"] else ""
-    return role.lower() in act
-
-def pick_vacancies(rows: List[List[str]], role: str, want: int) -> Dict[str, Any]:
-    items: List[Dict[str, Any]] = []
-    for i, row in enumerate(rows):
-        if i == 0:  # заголовок
-            continue
-        if not role_matches(row, role):
-            continue
-        smax = salary_from_row(row)
-        if smax is None:
-            continue
-        items.append({
-            "idx": i,
-            "salary": smax,
-            "title": row[COL["TITLE"]] if len(row) > COL["TITLE"] else "Вакансия",
-            "employer": row[COL["EMPLOYER"]] if len(row) > COL["EMPLOYER"] else "",
-            "desc": row[COL["DESC"]] if len(row) > COL["DESC"] else "",
-        })
-    items.sort(key=lambda x: x["salary"], reverse=True)
-    top = items[:5]
-    return {"items": top, "found_higher": any(x["salary"] >= want for x in top)}
-
-def pretty_rub(n: int) -> str:
-    return f"{n:,}".replace(",", " ") + " ₽"
-
-async def show_results_list(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                            results: Dict[str, Any], want: Optional[int] = None):
-    items = results.get("items", [])
-    found_higher = results.get("found_higher", False)
-
-    if not items:
-        await send_text(update, 
-            "Пока нет подходящих вакансий. Попробуйте позже.")
-        return
-
-    header = "Ура! Я нашёл зарплату выше твоего запроса 🎉" if (want and found_higher) \
-             else "К сожалению, не нашёл именно такую зарплату, но есть варианты ниже:"
-
-    lines = [header, ""]
-    kb = []
-    for it in items:
-        title = it["title"] or "Вакансия"
-        line = f"• {title} — {pretty_rub(it['salary'])}"
-        lines.append(line)
-        kb.append([InlineKeyboardButton(line[2:], callback_data=f"open:{it['idx']}")])
-
-    await send_text(update, 
-        "\n".join(lines), reply_markup=InlineKeyboardMarkup(kb)
-    )
-
-# ===== Хэндлеры =====
+# ================== ХЕНДЛЕРЫ ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🔎 Найти вакансии", callback_data="find")]]
-    )
-    await send_text(update, 
-        "Привет! Я помогу тебе найти работу с самыми высокими зарплатами. "
-        "Напиши, что тебя интересует — начнём!",
-        reply_markup=kb
-    )
+    buttons = [[InlineKeyboardButton("🔎 Найти вакансии", callback_data="find")]]
+    await update.effective_message.reply_text(MSG_GREETING, reply_markup=kb(buttons))
 
-async def btn_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    data = q.data
-    await q.answer()
+    data = (q.data or "") if q else ""
+    if q: await q.answer()
 
     if data == "find":
-        kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton(c, callback_data=f"city:{c}")] for c in CITIES]
+        rows = await get_rows(context)
+        cities = unique_cities(rows)
+        # пока основная — Москва
+        btns = [InlineKeyboardButton(c, callback_data=f"city:{c}") for c in cities]
+        buttons = chunked(btns, 2)
+        await (q.edit_message_text if q else update.effective_message.reply_text)(
+            MSG_CHOOSE_CITY, reply_markup=kb(buttons)
         )
-        await q.edit_message_text("Выберите город:", reply_markup=kb)
-        context.user_data["state"] = "CHOOSE_CITY"
         return
 
     if data.startswith("city:"):
         city = data.split(":", 1)[1]
         context.user_data["city"] = city
-        kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton(r, callback_data=f"role:{r}")] for r in ROLES]
+        btns = [InlineKeyboardButton(r, callback_data=f"role:{r}") for r in ROLES]
+        buttons = chunked(btns, 2)
+        await (q.edit_message_text if q else update.effective_message.reply_text)(
+            MSG_CHOOSE_ROLE, reply_markup=kb(buttons)
         )
-        await q.edit_message_text(f"Город: {city}\nКем хотите работать?", reply_markup=kb)
-        context.user_data["state"] = "CHOOSE_ROLE"
         return
 
     if data.startswith("role:"):
         role = data.split(":", 1)[1]
         context.user_data["role"] = role
-        context.user_data["state"] = "AWAIT_SALARY"
-        await q.edit_message_text(
-            f"Город: {context.user_data.get('city')}\nРоль: {role}\n\n"
-            "Введите желаемую зарплату в месяц (например: 90 000):"
+        context.user_data["await_salary"] = True
+        await (q.edit_message_text if q else update.effective_message.reply_text)(
+            f"Город: {context.user_data.get('city','Москва')}\nРоль: {role}\n\n{MSG_ASK_SALARY}"
         )
         return
 
-    if data.startswith("open:"):
+    if data.startswith("vac:"):
         idx = int(data.split(":", 1)[1])
-        rows = context.user_data.get("rows_cache") or []
-        if not rows or idx <= 0 or idx >= len(rows):
-            await q.edit_message_text("Запись недоступна, попробуйте снова /start.")
+        results = context.user_data.get("results", [])
+        if not (0 <= idx < len(results)):
+            if q: await q.answer("Вакансия не найдена", show_alert=True)
             return
-        row = rows[idx]
-        desc = row[COL["DESC"]] if len(row) > COL["DESC"] else "Описание недоступно."
-        desc = format_vacancy_desc(desc)
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Назад к вакансиям", callback_data="back_to_list"),
+        row = results[idx]["row"]
+        desc = clean_description(row[COL_DESC] if len(row) > COL_DESC else "")
+        title = title_from_row(row)
+        city = city_from_row(row)
+        sal = results[idx]["salary"]
+        buttons = [
+            [InlineKeyboardButton("◀️ Назад к вакансиям", callback_data="back_to_results"),
              InlineKeyboardButton("✅ Откликнуться", callback_data=f"apply:{idx}")]
-        ])
-        await q.edit_message_text(desc, reply_markup=kb)
+        ]
+        text = f"{title}\n🏙 {city}\n💰 Зарплата: {sal:,} ₽\n\n{desc}".replace(",", " ")
+        await (q.edit_message_text if q else update.effective_message.reply_text)(
+            text, reply_markup=kb(buttons)
+        )
         return
 
-    if data == "back_to_list":
-        results = context.user_data.get("last_results", {})
-        await show_results_list(update, context, results)
+    if data == "back_to_results":
+        await show_results_list(update, context)
         return
 
     if data.startswith("apply:"):
-        await q.edit_message_text("Отлично! Я передам ваше желание откликнуться. (демо)")
+        if q: await q.answer("Заявка отправлена! (демо)", show_alert=True)
         return
 
-async def ask_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text_in = (update.message.text or "").strip()
-    want = parse_salary_value(text_in)
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("await_salary"):
+        return
+    want = parse_salary_value(update.effective_message.text or "")
     if not want:
-        await send_text(update, 
-            "Я не понял сумму. Напиши *только цифрами* без слов, например: `90000`.\n"
-            "Поддерживаются: `90 000`, `90k/90к`, `90 тыс`, `1.2м`.",
-            parse_mode="Markdown"
-        )
+        await update.effective_message.reply_text(MSG_SALARY_BAD)
         return
+    context.user_data["await_salary"] = False
+    context.user_data["want_salary"] = want
+    await do_search(update, context)
 
-    context.user_data["salary"] = want
-    await send_text(update, f"Принял сумму: {pretty_rub(want)}. Ищу подходящие вакансии…")
-
-    rows = await fetch_sheet_rows()
-    if not rows:
-        await send_text(update, "Не удалось получить вакансии. Попробуйте позже.")
-        return
-    context.user_data["rows_cache"] = rows
-
+async def do_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    city = context.user_data.get("city", "Москва")
     role = context.user_data.get("role", "")
-    results = pick_vacancies(rows, role, want)
-    context.user_data["last_results"] = results
-    await show_results_list(update, context, results, want)
+    want = context.user_data.get("want_salary", 0)
 
-async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("state") == "AWAIT_SALARY":
-        await ask_salary(update, context)
+    rows_all = await get_rows(context)
+    # фильтр по городу
+    rows = [r for r in rows_all if norm_lc(r[COL_CITY] if len(r) > COL_CITY else "") == norm_lc(city)]
+    # фильтр по роли
+    rows = [r for r in rows if (len(r) > COL_ROLE and role_match(r, role))]
+    if not rows:
+        await update.effective_message.reply_text(MSG_EMPTY)
         return
-    # игнорируем свободный ввод
-    return
 
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_text(update, "pong")
+    prepared = [{"row": r, "salary": salary_from_row(r)} for r in rows]
+    prepared.sort(key=lambda x: x["salary"], reverse=True)
+    top = prepared[:5]
+    context.user_data["results"] = top
 
+    any_ge = any(item["salary"] >= want for item in top)
+    head = MSG_FOUND_ABOVE if any_ge else MSG_FOUND_BELOW
 
-
-def format_vacancy_desc(raw: str) -> str:
-    """Простой и безопасный форматтер.
-    - Чистит HTML (<br>, любые теги).
-    - Убирает маркдаун-скобки (** ` и т.п.), длинные «----».
-    - Режет только «адресные простыни» после заголовков вида «Ищем водител… по адрес…».
-    - Любая непустая строка становится пунктом «• …»; заголовки — только по ключам/двоеточию.
-    """
-    import re
-    if not raw:
-        return "Описание недоступно."
-
-    t = raw.replace("\r\n", "\n").replace("\r", "\n")
-
-    # HTML → текст
-    t = re.sub(r"(?is)<br\s*/?>", "\n", t)
-    t = re.sub(r"(?is)</?p[^>]*>", "\n", t)
-    t = re.sub(r"(?is)</?(ul|ol|li)[^>]*>", "\n", t)
-    t = re.sub(r"(?is)</[^>]+>", " ", t)   # любые прочие теги → пробел
-    t = re.sub(r"[\t\xa0]", " ", t)
-
-    # Маркдаун/мусор
-    t = re.sub(r"[`*]{1,3}", "", t)
-    t = re.sub(r"_{2,}", "_", t)
-    t = re.sub(r"^\s*[-–—]{3,}\s*$", "", t, flags=re.MULTILINE)  # горизонтальные «линейки»
-    t = re.sub(r"\s*[-–—]{2,}\s*", " — ", t)                      # ---, -- → « — »
-
-    # Заголовки по ключам
-    hdr_rules = [
-        (r"^(мы\s+предлагаем|условия|что\s+предлагаем|что\s+получишь)\b", "💼 Мы предлагаем"),
-        (r"^(обязанности|что\s+нужно\s+делать|что\s+делать|чем\s+заниматься)\b", "🧰 Обязанности"),
-        (r"^(требования|мы\s+ожидаем|кандидат|что\s+нужно)\b", "✅ Требования"),
-        (r"^(оплата|зарплата|доход|компенсации|бонусы|условия\s+оплаты)\b", "💰 Оплата и бонусы"),
-        (r"^(как\s+откликнуться|что\s+делать\s+дальше|как\s+начать|оформление)\b", "📩 Как откликнуться"),
-    ]
-    def detect_header(line: str):
-        low = line.lower()
-        for pat, h in hdr_rules:
-            if re.search(pat, low):
-                return h
-        if len(line) <= 100 and line.endswith(":"):
-            return "📌 " + line[:-1]
-        return None
-
-    # Чистка лидирующих маркеров
-    def unbullet(s: str) -> str:
-        s = s.strip()
-        s = re.sub(r"^[\-–—•*·\u2022]+[)\.]?\s*", "", s)
-        s = re.sub(r"^\d+\)\s*", "", s)        # 1)
-        s = re.sub(r"^\(\d+\)\s*", "", s)     # (1)
-        return re.sub(r"\s{2,}", " ", s).strip()
-
-    raw_lines = [unbullet(x) for x in t.split("\n")]
-
-    # Схлопываем пустые
     lines = []
-    for ln in raw_lines:
-        if ln == "" and (not lines or lines[-1] == ""):
-            continue
-        lines.append(ln)
+    for i, it in enumerate(top, 1):
+        row = it["row"]
+        sal = it["salary"]
+        lines.append(f"{i}. {title_from_row(row)} — {sal:,} ₽".replace(",", " "))
+    text = f"{head}\n\nГород: {city}\nРоль: {role}\nЖелаемая: {want:,} ₽\n\n".replace(",", " ") + "\n".join(lines)
 
-    out, buf = [], []
+    # кнопки 1..N
+    btns = [[InlineKeyboardButton(f"{i+1}", callback_data=f"vac:{i}") for i in range(len(top))]]
+    btns.append([InlineKeyboardButton("⬅️ Назад (выбрать заново)", callback_data="find")])
 
-    def flush():
-        if not buf:
-            return
-        out.extend([f"• {x}" for x in buf if x])
-        buf.clear()
+    await update.effective_message.reply_text(text, reply_markup=kb(btns))
 
-    # Скип адресных простыней ТОЛЬКО после явного заголовка
-    skip_addr = False
-    addr_kw = r"(ул\.|просп\.|шосс\.|пл\.|пер\.|бул\.|км\b|стр\.|дом\b|д\.|корп\.|к\.|лит\.|пр-т\.|ш\.|наб\.|пр\.)"
+async def show_results_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    results = context.user_data.get("results", [])
+    if not results:
+        await update.effective_message.reply_text(MSG_EMPTY)
+        return
+    lines = []
+    for i, it in enumerate(results, 1):
+        row = it["row"]
+        sal = it["salary"]
+        lines.append(f"{i}. {title_from_row(row)} — {sal:,} ₽".replace(",", " "))
+    btns = [[InlineKeyboardButton(f"{i+1}", callback_data=f"vac:{i}") for i in range(len(results))]]
+    btns.append([InlineKeyboardButton("⬅️ Назад (выбрать заново)", callback_data="find")])
+    await update.effective_message.reply_text("Выберите вакансию:\n\n" + "\n".join(lines), reply_markup=kb(btns))
 
-    for ln in lines:
-        if skip_addr:
-            if ln == "" or detect_header(ln):
-                skip_addr = False
-                if ln == "":
-                    continue
-            else:
-                if ln.startswith("|") or re.fullmatch(r"[\|\-–—\s]+", ln) or re.search(addr_kw, ln, re.IGNORECASE) or ln.count(",") >= 2:
-                    continue
-                skip_addr = False  # вышли из адресного текста
 
-        if ln == "":
-            flush()
-            if out and out[-1] != "":
-                out.append("")
-            continue
-
-        low = ln.lower()
-        if ("ищем" in low and "водител" in low and ("по адрес" in low or "адреса" in low)):
-            flush()          # заголовок не показываем
-            skip_addr = True # и включаем скип адресов
-            continue
-
-        hdr = detect_header(ln)
-        if hdr:
-            flush()
-            if out and out[-1] != "":
-                out.append("")
-            out.append(hdr)
-            out.append("")
-            continue
-
-        buf.append(ln)
-
-    flush()
-
-    result = "\n".join([ln for i, ln in enumerate(out) if not (ln == "" and (i == 0 or out[i-1] == ""))]).strip()
-    return result or "Описание недоступно."
-
-async def back_to_results(update, context):
-    """Возврат к списку последних найденных вакансий."""
-    query = update.callback_query
-    if query:
-        await query.answer()
-    results = context.user_data.get("last_results") or []
-    role    = context.user_data.get("role") or ""
-    city    = context.user_data.get("city") or "Москва"
-    await show_results_list(update, context, results, city=city, role=role)
-
-def main():
+# ================== WIRING ==================
+def build_app() -> Application:
     app = Application.builder().token(TOKEN).build()
-
-    # команды
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("ping", ping))
-    # кнопки и текст
-    app.add_handler(CallbackQueryHandler(btn_router))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+    app.add_handler(CallbackQueryHandler(on_cb))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    return app
 
-    async def _post_init(_: Application):
-        # снимаем вебхук на всякий случай (чтобы polling не конфликтовал)
-        try:
-            await app.bot.delete_webhook(drop_pending_updates=False)
-        except Exception:
-            pass
-        me = await app.bot.get_me()
-        print(f"[✓] Bot online: @{me.username}", flush=True)
-
-    app.post_init = _post_init
-    app.run_polling()
+def main() -> None:
+    app = build_app()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
